@@ -1,5 +1,13 @@
 #define WIN32_LEAN_AND_MEAN
 #define __STDC_WANT_LIB_EXT1__ 1
+
+#define STATUS_INFO_LENGTH_MISMATCH 0xC0000004
+#define SystemProcessInformation 5
+#define ThreadBasicInformation 0
+
+// max stack size - 1mb
+#define MAX_STACK_SIZE ((1024 * 1024) / sizeof(DWORD))
+
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,8 +20,8 @@
 #include <time.h>
 #include <algorithm>
 #include <iomanip>
-#include <tlhelp32.h> 
-#include <tchar.h> 
+#include <tlhelp32.h>
+#include <tchar.h>
 #include <locale>
 #include <codecvt>
 #include <boost/program_options.hpp>
@@ -26,6 +34,148 @@
 #include <psapi.h>
 #pragma comment( lib, "Version.lib" )
 
+struct CLIENT_ID
+{
+	HANDLE UniqueProcess;
+	HANDLE UniqueThread;
+};
+
+struct THREAD_BASIC_INFORMATION
+{
+	DWORD ExitStatus;
+	PVOID TebBaseAddress;
+	CLIENT_ID ClientId;
+	PVOID AffinityMask;
+	DWORD Priority;
+	DWORD BasePriority;
+};
+
+struct UNICODE_STRING
+{
+	USHORT Length;
+	USHORT MaximumLength;
+	PWSTR Buffer;
+};
+
+struct OBJECT_ATTRIBUTES
+{
+	ULONG Length;
+	HANDLE RootDirectory;
+	UNICODE_STRING* ObjectName;
+	ULONG Attributes;
+	PVOID SecurityDescriptor;
+	PVOID SecurityQualityOfService;
+};
+
+struct SYSTEM_PROCESS_INFORMATION
+{
+	ULONG NextEntryOffset;
+	ULONG NumberOfThreads;
+	BYTE Reserved1[48];
+	UNICODE_STRING ImageName;
+	DWORD BasePriority;
+	HANDLE UniqueProcessId;
+	PVOID Reserved2;
+	ULONG HandleCount;
+	ULONG SessionId;
+	PVOID Reserved3;
+	SIZE_T PeakVirtualSize;
+	SIZE_T VirtualSize;
+	ULONG Reserved4;
+	SIZE_T PeakWorkingSetSize;
+	SIZE_T WorkingSetSize;
+	PVOID Reserved5;
+	SIZE_T QuotaPagedPoolUsage;
+	PVOID Reserved6;
+	SIZE_T QuotaNonPagedPoolUsage;
+	SIZE_T PagefileUsage;
+	SIZE_T PeakPagefileUsage;
+	SIZE_T PrivatePageCount;
+	LARGE_INTEGER Reserved7[6];
+};
+
+struct SYSTEM_THREAD_INFORMATION
+{
+	LARGE_INTEGER Reserved1[3];
+	ULONG Reserved2;
+	PVOID StartAddress;
+	CLIENT_ID ClientId;
+	DWORD Priority;
+	LONG BasePriority;
+	ULONG Reserved3;
+	ULONG ThreadState;
+	ULONG WaitReason;
+};
+
+DWORD(WINAPI* NtQuerySystemInformation)(DWORD SystemInformationClass, PVOID SystemInformation, ULONG SystemInformationLength, PULONG ReturnLength);
+DWORD(WINAPI* NtQueryInformationThread)(HANDLE ThreadHandle, DWORD ThreadInformationClass, PVOID ThreadInformation, ULONG ThreadInformationLength, PULONG ReturnLength);
+DWORD(WINAPI* NtOpenThread)(HANDLE* ThreadHandle, DWORD DesiredAccess, OBJECT_ATTRIBUTES* ObjectAttributes, CLIENT_ID* ClientId);
+
+DWORD dwGlobal_Stack[MAX_STACK_SIZE];
+HANDLE hGlobal_LogFile = NULL;
+
+SYSTEM_PROCESS_INFORMATION* pGlobal_SystemProcessInfo = NULL;
+
+
+DWORD GetSystemProcessInformation()
+{
+	DWORD dwAllocSize = 0;
+	DWORD dwStatus = 0;
+	DWORD dwLength = 0;
+	BYTE* pSystemProcessInfoBuffer = NULL;
+
+	// free previous handle info list (if one exists)
+	if (pGlobal_SystemProcessInfo != NULL)
+	{
+		free(pGlobal_SystemProcessInfo);
+	}
+
+	// get system handle list
+	dwAllocSize = 0;
+	for (;;)
+	{
+		if (pSystemProcessInfoBuffer != NULL)
+		{
+			// free previous inadequately sized buffer
+			free(pSystemProcessInfoBuffer);
+			pSystemProcessInfoBuffer = NULL;
+		}
+
+		if (dwAllocSize != 0)
+		{
+			// allocate new buffer
+			pSystemProcessInfoBuffer = (BYTE*)malloc(dwAllocSize);
+			if (pSystemProcessInfoBuffer == NULL)
+			{
+				return 1;
+			}
+		}
+
+		// get system handle list
+		dwStatus = NtQuerySystemInformation(SystemProcessInformation, (void*)pSystemProcessInfoBuffer, dwAllocSize, &dwLength);
+		if (dwStatus == 0)
+		{
+			// success
+			break;
+		}
+		else if (dwStatus == STATUS_INFO_LENGTH_MISMATCH)
+		{
+			// not enough space - allocate a larger buffer and try again (also add an extra 1kb to allow for additional data between checks)
+			dwAllocSize = (dwLength + 1024);
+		}
+		else
+		{
+			// other error
+			free(pSystemProcessInfoBuffer);
+			return 1;
+		}
+	}
+
+	// store handle info ptr
+	pGlobal_SystemProcessInfo = (SYSTEM_PROCESS_INFORMATION*)pSystemProcessInfoBuffer;
+
+	return 0;
+}
 
 struct ArgumentManager {
 
@@ -43,6 +193,8 @@ struct ArgumentManager {
 			("output-directory,o", po::value<std::string>(), "Directory where the output will be stored")
 			("pid,p", po::value<int>()->required(), "Process ID")
 			("protections,s", po::value<std::string>(), "Memory protections")
+			("types,t", po::value<std::string>(), "Section type")
+			("thread-stack,r", "Generate an aditional file with the adresses of the stack of each thread and the dump file where it is")
 			("version,v", "Version")
 			;
 
@@ -109,6 +261,15 @@ struct ArgumentManager {
 			}
 		}
 
+		if (vm.count("types")) {
+			validateTypes(vm["types"].as<std::string>());
+			isTypesOptionSupplied = true;
+		}
+
+		if (vm.count("thread-stack")) {
+			isThreadStackOptionSupplied = true;
+		}
+
 	}
 
 	int getPid() {
@@ -131,6 +292,10 @@ struct ArgumentManager {
 		return outputDirectory;
 	}
 
+	std::vector<std::string>& getTypes() {
+		return types;
+	}
+
 	bool getIsModuleOptionSupplied() {
 		return isModuleOptionSupplied;
 	}
@@ -149,6 +314,14 @@ struct ArgumentManager {
 
 	bool getIsFileVersionInfoOptionSupplied() {
 		return isFileVersionInfoOptionSupplied;
+	}
+
+	bool getIsTypesOptionSupplied() {
+		return isTypesOptionSupplied;
+	}
+
+	bool getIsThreadStackOptionSupplied() {
+		return isThreadStackOptionSupplied;
 	}
 
 private:
@@ -185,6 +358,34 @@ private:
 		isProtectionsOptionSupplied = true;
 	}
 
+	void validateTypes(std::string suppliedTypesAsString) {
+		std::vector<std::string> supportedTypes{
+			"MEM_IMAGE",
+			"MEM_MAPPED",
+			"MEM_PRIVATE"
+		};
+		std::vector<std::string> suppliedTypes;
+		boost::split(suppliedTypes, suppliedTypesAsString, boost::is_any_of(" "));
+		BOOST_FOREACH(const std::string & type, suppliedTypes) {
+			bool isTypeRepeated = std::find(types.begin(), types.end(), type) != types.end();
+			if (isTypeRepeated) {
+				SetLastError(160);
+				throw std::invalid_argument{ "The same type of page cannot be supplied more than once" };
+			}
+
+			bool isTypeSupported = std::find(supportedTypes.begin(), supportedTypes.end(), type) != supportedTypes.end();
+			if (isTypeSupported) {
+				types.push_back(type);
+			}
+			else {
+				SetLastError(160);
+				throw std::invalid_argument{ "The memory page types supplied are invalid. "
+					"Supply only supported ones, separate each one with a space, and enclose all of them in quotes" };
+			}
+		}
+		isTypesOptionSupplied = true;
+	}
+
 	bool directoryExists(const std::string& suppliedDirectoryAsString)
 	{
 		DWORD fileAttributes = GetFileAttributesA(suppliedDirectoryAsString.c_str());
@@ -205,13 +406,16 @@ private:
 	std::string module;
 	std::vector<std::string> protections;
 	std::string outputDirectory;
+	std::vector<std::string> types;
 
 	// Options
-	bool isModuleOptionSupplied;
-	bool isProtectionsOptionSupplied;
-	bool isJoinOptionSupplied;
-	bool isOutputDirectoryOptionSupplied;
-	bool isFileVersionInfoOptionSupplied;
+	bool isModuleOptionSupplied = false;
+	bool isProtectionsOptionSupplied = false;
+	bool isJoinOptionSupplied = false;
+	bool isOutputDirectoryOptionSupplied = false;
+	bool isFileVersionInfoOptionSupplied = false;
+	bool isTypesOptionSupplied = false;
+	bool isThreadStackOptionSupplied = false;
 
 };
 
@@ -221,6 +425,8 @@ struct MemoryExtractionManager {
 	MemoryExtractionManager(ArgumentManager& argumentManagerReceived) : argumentManager{ argumentManagerReceived } {}
 
 	void extractMemoryContents() {
+
+		GetNtdllFunctions();
 
 		HANDLE processHandle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, argumentManager.getPid());
 		if (processHandle == NULL) {
@@ -370,12 +576,176 @@ struct MemoryExtractionManager {
 			moduleFileVersionInfoStream.close();
 		}
 
+		
+
 		resultsFile << std::endl;
+
+		if (argumentManager.getIsThreadStackOptionSupplied()) {
+			std::ofstream stacksResultsFile(directoryName + "/stacks/results.txt", std::ofstream::out);
+			stacksResultsFile << "List of.dmp files generated : " << "\n";
+			getStacks(processHandle, stacksResultsFile);
+			stacksResultsFile << "Number of .dmp files generated: " << dmpStackFilesGeneratedCount << "\n";
+			stacksResultsFile.close();
+		}
+
 		resultsFile.close();
 		CloseHandle(processHandle);
 	}
 
 private:
+	ArgumentManager& argumentManager;
+	std::string directoryName; // The directory where the memory data files will be placed
+	bool isDirectoryCreated = false;
+	unsigned int dmpFilesGeneratedCount = 0;
+	unsigned int dmpStackFilesGeneratedCount = 0;
+	SIZE_T nextAddressAfterModuleRegion;
+
+	DWORD GetNtdllFunctions()
+	{
+		// get NtQueryInformationThread ptr
+		NtQueryInformationThread = (unsigned long(__stdcall*)(void*, unsigned long, void*, unsigned long, unsigned long*))GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
+		if (NtQueryInformationThread == NULL)
+		{
+			return 1;
+		}
+
+		// get NtQuerySystemInformation function ptr
+		NtQuerySystemInformation = (unsigned long(__stdcall*)(unsigned long, void*, unsigned long, unsigned long*))GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQuerySystemInformation");
+		if (NtQuerySystemInformation == NULL)
+		{
+			return 1;
+		}
+
+		// get NtOpenThread function ptr
+		NtOpenThread = (unsigned long(__stdcall*)(void**, unsigned long, struct OBJECT_ATTRIBUTES*, struct CLIENT_ID*))GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtOpenThread");
+		if (NtOpenThread == NULL)
+		{
+			return 1;
+		}
+
+		return 0;
+	}
+
+	DWORD getStacks(HANDLE hProcess, std::ofstream& resultsFile) {
+		HANDLE hThread = NULL;
+		SYSTEM_PROCESS_INFORMATION* pCurrProcessInfo = NULL;
+		SYSTEM_PROCESS_INFORMATION* pNextProcessInfo = NULL;
+		SYSTEM_PROCESS_INFORMATION* pTargetProcessInfo = NULL;
+		SYSTEM_THREAD_INFORMATION* pCurrThreadInfo = NULL;
+		OBJECT_ATTRIBUTES ObjectAttributes;
+		DWORD dwStatus = 0;
+
+		// get snapshot of processes/threads
+		if (GetSystemProcessInformation() != 0)
+		{
+			return 1;
+		}
+
+		// find the target process in the list
+		pCurrProcessInfo = pGlobal_SystemProcessInfo;
+		for (;;)
+		{
+			// check if this is the target PID
+			if ((DWORD)pCurrProcessInfo->UniqueProcessId == argumentManager.getPid())
+			{
+				// found target process
+				pTargetProcessInfo = pCurrProcessInfo;
+				break;
+			}
+
+			// check if this is the end of the list
+			if (pCurrProcessInfo->NextEntryOffset == 0)
+			{
+				// end of list
+				break;
+			}
+			else
+			{
+				// get next process ptr
+				pNextProcessInfo = (SYSTEM_PROCESS_INFORMATION*)((BYTE*)pCurrProcessInfo + pCurrProcessInfo->NextEntryOffset);
+			}
+
+			// go to next process
+			pCurrProcessInfo = pNextProcessInfo;
+		}
+
+		// ensure the target process was found in the list
+		if (pTargetProcessInfo == NULL)
+		{
+			return 1;
+		}
+
+		// loop through all threads within the target process
+		pCurrThreadInfo = (SYSTEM_THREAD_INFORMATION*)((BYTE*)pTargetProcessInfo + sizeof(SYSTEM_PROCESS_INFORMATION));
+		for (DWORD i = 0; i < pTargetProcessInfo->NumberOfThreads; i++)
+		{
+			// open thread
+			memset((void*)&ObjectAttributes, 0, sizeof(ObjectAttributes));
+			ObjectAttributes.Length = sizeof(ObjectAttributes);
+			dwStatus = NtOpenThread(&hThread, THREAD_QUERY_INFORMATION, &ObjectAttributes, &pCurrThreadInfo->ClientId);
+			if (dwStatus == 0)
+			{
+				// extract strings from the stack of this thread
+				//GetStackStrings(hProcess, hThread, (DWORD)pCurrThreadInfo->ClientId.UniqueThread, pStringFilter);
+				THREAD_BASIC_INFORMATION ThreadBasicInformationData;
+				NT_TIB ThreadTEB;
+				DWORD dwStackSize = 0;
+
+				// get thread basic information
+				memset((void*)&ThreadBasicInformationData, 0, sizeof(ThreadBasicInformationData));
+				if (NtQueryInformationThread(hThread, ThreadBasicInformation, &ThreadBasicInformationData, sizeof(THREAD_BASIC_INFORMATION), NULL) != 0)
+				{
+					return 1;
+				}
+
+				// read thread TEB
+				memset((void*)&ThreadTEB, 0, sizeof(ThreadTEB));
+				if (ReadProcessMemory(hProcess, ThreadBasicInformationData.TebBaseAddress, &ThreadTEB, sizeof(ThreadTEB), NULL) == 0)
+				{
+					return 1;
+				}
+
+				// calculate thread stack size
+				dwStackSize = (DWORD)ThreadTEB.StackBase - (DWORD)ThreadTEB.StackLimit;
+				if (dwStackSize > sizeof(dwGlobal_Stack))
+				{
+					std::cerr << "Stack bigger than the buffer where was about to be dumped" << std::endl;
+					return 1;
+				}
+				
+				// read full thread stack
+				auto stackContents = std::make_unique<char[]>(dwStackSize);
+				if (ReadProcessMemory(hProcess, ThreadTEB.StackLimit, stackContents.get(), dwStackSize, NULL) == 0)
+				{
+					return 1;
+				}
+
+				//dump stack content into file
+				std::stringstream fileNameStream;
+				fileNameStream << ThreadTEB.StackBase << "_" << std::hex << dwStackSize << ".dmp";
+				std::string fileName = fileNameStream.str();
+				boost::algorithm::to_lower(fileName);
+
+				std::string filePath = directoryName + "/stacks/" + fileName;
+
+				std::ofstream memoryDataFile(filePath, std::ofstream::binary);
+				memoryDataFile.write(stackContents.get(), dwStackSize);
+				memoryDataFile.close();
+
+				dmpStackFilesGeneratedCount++;
+
+				registerDmpStackFileCreation(fileName, stackContents.get(), dwStackSize, resultsFile);
+
+				// close handle
+				CloseHandle(hThread);
+			}
+
+			// move to the next thread
+			pCurrThreadInfo++;
+		}
+
+		return 0;
+	}
 
 	MODULEENTRY32 getModuleInformation(std::string& suppliedModuleName) {
 		HANDLE snapshotHandle = INVALID_HANDLE_VALUE;
@@ -389,7 +759,7 @@ private:
 
 		moduleEntry.dwSize = sizeof(MODULEENTRY32);
 
-		// Get the information about the first module 
+		// Get the information about the first module
 		if (!Module32First(snapshotHandle, &moduleEntry)) {
 			CloseHandle(snapshotHandle);
 			throw std::exception{ "The information of the first module could not be retrieved" };
@@ -398,7 +768,7 @@ private:
 		std::wstring_convert<std::codecvt_utf8_utf16<wchar_t>> stringConverter;
 		std::string moduleName;
 
-		// Get the information about the rest of the modules 
+		// Get the information about the rest of the modules
 		do {
 			moduleName = stringConverter.to_bytes(moduleEntry.szModule);
 			boost::algorithm::to_lower(moduleName);
@@ -427,6 +797,10 @@ private:
 		}
 		directoryNameStream << std::dec << argumentManager.getPid() << "_" << std::put_time(&buf, "%d-%m-%Y_%H-%M-%S_UTC");
 		CreateDirectoryA(directoryNameStream.str().c_str(), NULL);
+		if (argumentManager.getIsThreadStackOptionSupplied()) {
+			std::stringstream stacksDirectoryNameStream; stacksDirectoryNameStream << directoryNameStream.str() << "/stacks/";
+			CreateDirectoryA(stacksDirectoryNameStream.str().c_str(), NULL);
+		}
 		isDirectoryCreated = true;
 		return directoryNameStream.str();
 	}
@@ -434,7 +808,38 @@ private:
 	bool makeExtractionDecision(MEMORY_BASIC_INFORMATION& memInfo) {
 		DWORD state = memInfo.State;
 		DWORD protection = memInfo.Protect;
-		if (argumentManager.getIsProtectionsOptionSupplied()) {
+		DWORD type = memInfo.Type;
+		if (argumentManager.getIsProtectionsOptionSupplied() &&
+			argumentManager.getIsTypesOptionSupplied()) {
+
+			std::vector<std::string>& protections = argumentManager.getProtections();
+			std::vector<std::string>& types = argumentManager.getTypes();
+
+			bool isPageExecuteSupplied = std::find(protections.begin(), protections.end(), "PAGE_EXECUTE") != protections.end();
+			bool isPageExecuteReadSupplied = std::find(protections.begin(), protections.end(), "PAGE_EXECUTE_READ") != protections.end();
+			bool isPageExecuteReadWriteSupplied = std::find(protections.begin(), protections.end(), "PAGE_EXECUTE_READWRITE") != protections.end();
+			bool isPageExecuteWriteCopySupplied = std::find(protections.begin(), protections.end(), "PAGE_EXECUTE_WRITECOPY") != protections.end();
+			bool isPageReadOnlySupplied = std::find(protections.begin(), protections.end(), "PAGE_READONLY") != protections.end();
+			bool isPageReadWriteSupplied = std::find(protections.begin(), protections.end(), "PAGE_READWRITE") != protections.end();
+			bool isPageWriteCopySupplied = std::find(protections.begin(), protections.end(), "PAGE_WRITECOPY") != protections.end();
+
+			bool isTypeImageSupplied = std::find(types.begin(), types.end(), "MEM_IMAGE") != types.end();
+			bool isTypeMappedSupplied = std::find(types.begin(), types.end(), "MEM_MAPPED") != types.end();
+			bool isTypePrivateSupplied = std::find(types.begin(), types.end(), "MEM_PRIVATE") != types.end();
+
+			return state == MEM_COMMIT
+				&& ((protection == PAGE_EXECUTE && isPageExecuteSupplied)
+					|| (protection == PAGE_EXECUTE_READ && isPageExecuteReadSupplied)
+					|| (protection == PAGE_EXECUTE_READWRITE && isPageExecuteReadWriteSupplied)
+					|| (protection == PAGE_EXECUTE_WRITECOPY && isPageExecuteWriteCopySupplied)
+					|| (protection == PAGE_READONLY && isPageReadOnlySupplied)
+					|| (protection == PAGE_READWRITE && isPageReadWriteSupplied)
+					|| (protection == PAGE_WRITECOPY && isPageWriteCopySupplied))
+				&& ((type == MEM_IMAGE && isTypeImageSupplied)
+					|| (type == MEM_MAPPED && isTypeMappedSupplied)
+					|| (type == MEM_PRIVATE && isTypePrivateSupplied));
+		}
+		else if (argumentManager.getIsProtectionsOptionSupplied()) {
 			std::vector<std::string>& protections = argumentManager.getProtections();
 			bool isPageExecuteSupplied = std::find(protections.begin(), protections.end(), "PAGE_EXECUTE") != protections.end();
 			bool isPageExecuteReadSupplied = std::find(protections.begin(), protections.end(), "PAGE_EXECUTE_READ") != protections.end();
@@ -443,6 +848,7 @@ private:
 			bool isPageReadOnlySupplied = std::find(protections.begin(), protections.end(), "PAGE_READONLY") != protections.end();
 			bool isPageReadWriteSupplied = std::find(protections.begin(), protections.end(), "PAGE_READWRITE") != protections.end();
 			bool isPageWriteCopySupplied = std::find(protections.begin(), protections.end(), "PAGE_WRITECOPY") != protections.end();
+
 			return state == MEM_COMMIT
 				&& ((protection == PAGE_EXECUTE && isPageExecuteSupplied)
 					|| (protection == PAGE_EXECUTE_READ && isPageExecuteReadSupplied)
@@ -451,6 +857,18 @@ private:
 					|| (protection == PAGE_READONLY && isPageReadOnlySupplied)
 					|| (protection == PAGE_READWRITE && isPageReadWriteSupplied)
 					|| (protection == PAGE_WRITECOPY && isPageWriteCopySupplied)
+					);
+		}
+		else if (argumentManager.getIsTypesOptionSupplied()) {
+			std::vector<std::string>& types = argumentManager.getTypes();
+			bool isTypeImageSupplied = std::find(types.begin(), types.end(), "MEM_IMAGE") != types.end();
+			bool isTypeMappedSupplied = std::find(types.begin(), types.end(), "MEM_MAPPED") != types.end();
+			bool isTypePrivateSupplied = std::find(types.begin(), types.end(), "MEM_PRIVATE") != types.end();
+
+			return state == MEM_COMMIT
+				&& ((type == MEM_IMAGE && isTypeImageSupplied)
+					|| (protection == MEM_MAPPED && isTypeMappedSupplied)
+					|| (protection == MEM_PRIVATE && isTypePrivateSupplied)
 					);
 		}
 		else if (argumentManager.getIsModuleOptionSupplied()) {
@@ -513,6 +931,24 @@ private:
 		}
 	}
 
+	void registerDmpStackFileCreation(std::string& fileName, char* fileContents, size_t stackSize, std::ofstream& resultsFile) {
+		using namespace CryptoPP;
+
+		// Calculate the SHA-256 hash of the .dmp file contents
+		HexEncoder hexEncoder(new FileSink(resultsFile), false);
+		std::string sha256Digest;
+		SHA256 hash;
+		hash.Update((const byte*)fileContents, stackSize);
+		sha256Digest.resize(hash.DigestSize());
+		hash.Final((byte*)&sha256Digest[0]);
+
+		// Create an entry in the results file for the new .dmp file
+		resultsFile << "Filename: " << fileName << ", SHA-256: ";
+		StringSource(sha256Digest, true, new Redirector(hexEncoder));
+		resultsFile << "\n";
+	}
+
+
 	void registerDmpFileCreation(std::string& fileName, char* fileContents, MEMORY_BASIC_INFORMATION& memInfo, std::ofstream& resultsFile) {
 		using namespace CryptoPP;
 
@@ -523,7 +959,7 @@ private:
 		hash.Update((const byte*)fileContents, memInfo.RegionSize);
 		sha256Digest.resize(hash.DigestSize());
 		hash.Final((byte*)&sha256Digest[0]);
-
+		
 		// Create an entry in the results file for the new .dmp file
 		resultsFile << "Filename: " << fileName << ", SHA-256: ";
 		StringSource(sha256Digest, true, new Redirector(hexEncoder));
@@ -576,7 +1012,7 @@ private:
 
 		if (!LookupPrivilegeValue(
 			NULL,            // lookup privilege on local system
-			lpszPrivilege,   // privilege to lookup 
+			lpszPrivilege,   // privilege to lookup
 			&luid))        // receives LUID of privilege
 		{
 			printf("LookupPrivilegeValue error: %u\n", GetLastError());
@@ -661,11 +1097,7 @@ private:
 		moduleVersionInfoFile.close();
 	}
 
-	ArgumentManager& argumentManager;
-	std::string directoryName; // The directory where the memory data files will be placed
-	bool isDirectoryCreated;
-	unsigned int dmpFilesGeneratedCount;
-	SIZE_T nextAddressAfterModuleRegion;
+	//int hola;
 
 };
 
