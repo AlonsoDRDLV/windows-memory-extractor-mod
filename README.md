@@ -40,7 +40,7 @@ The following command will extract the memory regions whose memory region type a
 ```bash
 .\WindowsMemoryExtractor_x64.exe --pid 1234 --type "MEM_IMAGE"
 ```
-The tool is also alble to extract the stacks of every thread of the process if commanded so.
+The tool is also able to extract the stacks of every thread of the process if commanded so.
 The following command will extract the stacks of the process whose PID is 1234:
 
 ```bash
