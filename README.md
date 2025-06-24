@@ -34,6 +34,19 @@ In addition, the tool allows you to specify a module of the process in order to 
 .\WindowsMemoryExtractor_x64.exe --pid 1234 --protections "PAGE_READONLY PAGE_EXECUTE_READ" --module user32.dll
 ```
 
+It is also possible to specify a type of memory region ("MEM_IMAGE", "MEM_MAPPED", "MEM_PRIVATE"). The tool will extract only regions of that memory region type.
+The following command will extract the memory regions whose memory region type are MEM_IMAGE of the process whose PID is 1234:
+
+```bash
+.\WindowsMemoryExtractor_x64.exe --pid 1234 --type "MEM_IMAGE"
+```
+The tool is also alble to extract the stacks of every thread of the process if commanded so.
+The following command will extract the stacks of the process whose PID is 1234:
+
+```bash
+.\WindowsMemoryExtractor_x64.exe --pid 1234 --thread-stack"
+```
+
 By default, if a module is provided but no memory protections are indicated, all the memory regions of that module whose protections match the supported ones will be extracted. The tool also has the --join option, in order to obtain the solicited memory regions of a module in one file. Additionally, if the user wants to get the version information about the file corresponding to a module, there is the --file-version-info option. Finally, for additional help, execute the command below:
 
 ```bash
